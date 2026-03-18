@@ -1,0 +1,60 @@
+-- No WHERE, String
+000000
+000001
+000002
+000003
+000004
+-- No WHERE, Nullable(String)
+000001
+000002
+000003
+000004
+000005
+-- WHERE on sort column (String)
+005001
+005002
+005003
+005004
+005005
+-- WHERE on sort column (Nullable)
+005001
+005002
+005003
+005004
+005005
+-- WHERE on different column (pushed to prewhere)
+000000
+000003
+000006
+000009
+000012
+-- WHERE on different column, Nullable sort
+000001
+000004
+000007
+000010
+000013
+-- Correctness: no WHERE (setting=0)
+000000
+000001
+000002
+000003
+000004
+-- Correctness: WHERE on sort column (setting=0)
+005001
+005002
+005003
+005004
+005005
+-- Correctness: WHERE on different column (setting=0)
+000000
+000003
+000006
+000009
+000012
+-- EXPLAIN no WHERE: has __topKFilter
+1
+-- EXPLAIN WHERE pushed to prewhere: no __topKFilter
+0
+-- EXPLAIN WHERE pushed to prewhere: has equals(cat)
+1
