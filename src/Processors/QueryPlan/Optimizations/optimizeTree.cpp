@@ -270,6 +270,20 @@ void optimizeTreeSecondPass(
             });
     }
 
+    /// Run top-K optimization AFTER prewhere push-down so that any WHERE
+    /// clause is already in prewhere.  When a WHERE predicate has been pushed
+    /// to prewhere, `tryOptimizeTopK` AND-combines `__topKFilter` with it.
+    /// When no prewhere exists, `__topKFilter` becomes the sole prewhere.
+    if (optimization_settings.try_use_top_k_optimization)
+    {
+        traverseQueryPlan(stack, root,
+            [](auto &) {},
+            [&](auto & frame_node)
+            {
+                tryOptimizeTopK(&frame_node, nodes, extra_settings);
+            });
+    }
+
     traverseQueryPlan(stack, root,
         [&](auto & frame_node)
         {

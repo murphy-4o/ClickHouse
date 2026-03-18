@@ -41,18 +41,20 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes, 
     if (node->children.size() != 1)
         return 0;
 
-    node = node->children.front();
-    auto * expression_step = typeid_cast<ExpressionStep *>(node->step.get());
-    if (expression_step)
-    {
-        if (node->children.size() != 1)
-            return 0;
-        node = node->children.front();
-    }
+    /// Walk through a chain of ExpressionStep / FilterStep nodes until we
+    /// reach ReadFromMergeTree.  After optimizePrewhere, the original Filter
+    /// may have been replaced by an Expression, creating multiple consecutive
+    /// ExpressionSteps.
+    auto * expression_step = typeid_cast<ExpressionStep *>(node->children.front()->step.get());
+    auto * filter_step = typeid_cast<FilterStep *>(node->children.front()->step.get());
 
-    auto * filter_step = typeid_cast<FilterStep *>(node->step.get());
-    if (filter_step)
+    node = node->children.front();
+    while (typeid_cast<ExpressionStep *>(node->step.get()) || typeid_cast<FilterStep *>(node->step.get()))
     {
+        if (!filter_step)
+            filter_step = typeid_cast<FilterStep *>(node->step.get());
+        if (!expression_step)
+            expression_step = typeid_cast<ExpressionStep *>(node->step.get());
         if (node->children.size() != 1)
             return 0;
         node = node->children.front();
@@ -79,28 +81,41 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes, 
 
     const bool where_clause = filter_step || read_from_mergetree_step->getPrewhereInfo();
 
-    ///remove alias
+    /// Resolve alias: walk back up through the ExpressionStep/FilterStep chain
+    /// to find where sort_column_name is aliased to the raw column name.
     if (sort_column_name.contains('.'))
     {
-        if (!expression_step && !filter_step)
-            return 0;
-
-        const ActionsDAG::Node * column_node = nullptr;
-        if (filter_step)
-            column_node = filter_step->getExpression().tryFindInOutputs(sort_column_name);
-        else
-            column_node = expression_step->getExpression().tryFindInOutputs(sort_column_name);
-
-        if (unlikely(!column_node))
-            return 0;
-
-        if (column_node->type == ActionsDAG::ActionType::ALIAS)
+        bool resolved = false;
+        QueryPlan::Node * walk = parent_node;
+        while (walk && walk->step.get() != read_from_mergetree_step)
         {
-            sort_column_name = column_node->children.at(0)->result_name;
+            auto * expr = typeid_cast<ExpressionStep *>(walk->step.get());
+            auto * filt = typeid_cast<FilterStep *>(walk->step.get());
+            const ActionsDAG * dag = nullptr;
+            if (expr)
+                dag = &expr->getExpression();
+            else if (filt)
+                dag = &filt->getExpression();
+
+            if (dag)
+            {
+                const auto * col_node = dag->tryFindInOutputs(sort_column_name);
+                if (col_node && col_node->type == ActionsDAG::ActionType::ALIAS)
+                {
+                    sort_column_name = col_node->children.at(0)->result_name;
+                    resolved = true;
+                    break;
+                }
+            }
+
+            if (walk->children.size() == 1)
+                walk = walk->children.front();
+            else
+                break;
         }
-        else
+        if (!resolved)
         {
-            LOG_DEBUG(getLogger("optimizeTopK"), "Could not resolve column alias {} {}", sort_column_name, column_node->type);
+            LOG_DEBUG(getLogger("optimizeTopK"), "Could not resolve column alias for {}", sort_column_name);
             return 0;
         }
     }
@@ -129,13 +144,22 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes, 
         && skip_index_type_eligible
         && read_from_mergetree_step->isSkipIndexAvailableForTopK(sort_column_name);
 
+    /// This optimization now runs AFTER optimizePrewhere.  Only inject
+    /// __topKFilter as prewhere when no prewhere exists yet; if a WHERE
+    /// was already pushed to prewhere, respect it and skip the prewhere
+    /// injection.  The TopKThresholdTracker still benefits sorting via
+    /// earlier remerge in MergeSortingTransform regardless.
     bool use_dynamic_filtering = settings.use_top_k_dynamic_filtering
         && !read_from_mergetree_step->getPrewhereInfo();
 
-    /// The threshold tracker is needed for dynamic mark skipping during reads
-    /// (use_skip_indexes_on_data_read) or for the prewhere dynamic filter.
-    /// Initial top-k mark selection (getTopKMarks) does not require it.
-    if ((use_skip_index && settings.use_skip_indexes_on_data_read) || use_dynamic_filtering)
+    /// Always create the tracker when the setting is enabled, even if
+    /// prewhere injection is skipped.  The tracker enables
+    /// PartialSortingTransform to publish thresholds at small LIMIT values
+    /// (below min_limit_for_partial_sort_optimization) and triggers
+    /// MergeSortingTransform to remerge earlier, reducing sort work.
+    bool use_threshold_tracker = settings.use_top_k_dynamic_filtering;
+
+    if ((use_skip_index && settings.use_skip_indexes_on_data_read) || use_threshold_tracker)
     {
         threshold_tracker = std::make_shared<TopKThresholdTracker>(sort_col_desc);
         sorting_step->setTopKThresholdTracker(threshold_tracker);
@@ -149,9 +173,7 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes, 
         NameAndTypePair sort_column_name_and_type(sort_column_name, sort_column.type);
         new_prewhere_info->prewhere_actions = ActionsDAG({sort_column_name_and_type});
 
-        /// Cannot use get() because need to pass an argument to constructor
-        /// auto filter_function = FunctionFactory::instance().get("__topKFilter",nullptr);
-        auto filter_function =  DB::createInternalFunctionTopKFilterResolver(threshold_tracker);
+        auto filter_function = DB::createInternalFunctionTopKFilterResolver(threshold_tracker);
         const auto & prewhere_node = new_prewhere_info->prewhere_actions.addFunction(
                 filter_function, {new_prewhere_info->prewhere_actions.getInputs().front()}, {});
         new_prewhere_info->prewhere_actions.getOutputs().push_back(&prewhere_node);
@@ -189,7 +211,7 @@ size_t tryOptimizeTopK(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes, 
     ///                                  \
     ///                                __topKFilter() (Prewhere filtering)
 
-    if (use_skip_index || use_dynamic_filtering)
+    if (use_skip_index || use_threshold_tracker)
         read_from_mergetree_step->setTopKColumn({sort_column_name, sort_column.type, num_sort_columns, n, sort_col_desc.direction, where_clause, threshold_tracker});
 
     return added_step ? 1 : 0;
