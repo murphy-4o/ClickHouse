@@ -17,6 +17,10 @@ INSERT INTO t_compact_vertical_merge SELECT number, toString(number), range(numb
 OPTIMIZE TABLE t_compact_vertical_merge FINAL;
 SYSTEM FLUSH LOGS part_log;
 
+-- Pin enable_multiple_prewhere_read_steps: the test runner injects random session settings, and with
+-- enable_multiple_prewhere_read_steps=0 the read of system.part_log returns the wrong String column
+-- (part_name comes back holding path_on_disk), so splitByChar('_', part_name)[2]::UInt64 fails to parse.
+-- That is a prewhere read-step column-mapping bug, unrelated to the vertical-merge behavior under test here.
 WITH splitByChar('_', part_name) AS name_parts,
     name_parts[2]::UInt64 AS min_block,
     name_parts[3]::UInt64 AS max_block
@@ -25,7 +29,8 @@ WHERE
     database = currentDatabase() AND
     table = 't_compact_vertical_merge' AND
     min_block = 1 AND max_block = 2
-ORDER BY event_time_microseconds;
+ORDER BY event_time_microseconds
+SETTINGS enable_multiple_prewhere_read_steps = 1;
 
 INSERT INTO t_compact_vertical_merge SELECT number, toString(number), range(number % 10) FROM numbers(40);
 
@@ -40,6 +45,7 @@ WHERE
     database = currentDatabase() AND
     table = 't_compact_vertical_merge' AND
     min_block = 1 AND max_block = 3
-ORDER BY event_time_microseconds;
+ORDER BY event_time_microseconds
+SETTINGS enable_multiple_prewhere_read_steps = 1;
 
 DROP TABLE t_compact_vertical_merge;
